@@ -60,6 +60,11 @@ def node_box(node: dict[str, Any]) -> list[float]:
     ]
 
 
+def node_box_absolute(node: dict[str, Any], offset_x: float = 0.0, offset_y: float = 0.0) -> list[float]:
+    x, y, width, height = node_box(node)
+    return [offset_x + x, offset_y + y, width, height]
+
+
 def count_text_chars(node: dict[str, Any]) -> int:
     total = 0
     for item in node.get("text") or []:
@@ -127,6 +132,24 @@ def child_type_counts(node: dict[str, Any]) -> dict[str, int]:
     return counts
 
 
+def is_atomic_visual_subtree(node: dict[str, Any]) -> bool:
+    descendants = count_descendants(node)
+    if descendants < 4:
+        return False
+    if count_types(node, "TEXT") > 0:
+        return False
+    if node.get("flexContainerInfo"):
+        return False
+    visual_count = (
+        count_types(node, "PATH")
+        + count_types(node, "LAYER")
+        + count_types(node, "SVG_ELLIPSE")
+    )
+    structural_count = count_types(node, "FRAME") + count_types(node, "GROUP")
+    # Keep dense vector/icon/chart groups intact instead of splitting by raw counts.
+    return visual_count >= max(3, descendants - structural_count)
+
+
 def structural_score(node: dict[str, Any], depth: int) -> int:
     kind = str(node.get("type") or "")
     children = node.get("children") or []
@@ -175,6 +198,8 @@ def is_chunk_candidate(node: dict[str, Any], depth: int, min_descendants: int) -
     descendants = count_descendants(node)
     if descendants < min_descendants:
         return False
+    if is_atomic_visual_subtree(node):
+        return True
 
     child_counts = child_type_counts(node)
     if kind == "FRAME":
@@ -195,6 +220,8 @@ class Candidate:
     depth: int
     path: str
     score: int
+    kind: str = "leaf"
+    absolute_bounds: list[float] | None = None
 
 
 def collect_candidates(root: dict[str, Any], min_descendants: int) -> list[Candidate]:
@@ -253,9 +280,10 @@ def has_structural_children(node: dict[str, Any]) -> bool:
     return len(children) >= 3 and count_types(node, "TEXT") >= 2
 
 
-def make_metrics(node: dict[str, Any], root_box: list[float]) -> dict[str, Any]:
+def make_metrics(node: dict[str, Any], root_box: list[float], absolute_x: float, absolute_y: float) -> dict[str, Any]:
     return {
         "bounds": node_box(node),
+        "absoluteBounds": node_box_absolute(node, absolute_x, absolute_y),
         "childCount": len(node.get("children") or []),
         "descendantCount": count_descendants(node),
         "maxDepth": max_depth(node),
@@ -285,8 +313,10 @@ def should_split_node(
     split_text_nodes: int,
     min_area_ratio: float,
 ) -> tuple[bool, dict[str, Any], list[str]]:
-    metrics = make_metrics(node, root_box)
+    metrics = make_metrics(node, root_box, absolute_x=0.0, absolute_y=0.0)
     reasons: list[str] = []
+    if is_atomic_visual_subtree(node):
+        return False, metrics, ["atomicVisualSubtree"]
     if metrics["descendantCount"] > split_descendants:
         reasons.append(f"descendantCount>{split_descendants}")
     if metrics["pathNodeCount"] > split_paths:
@@ -340,6 +370,8 @@ def build_chunk_tree(
     split_structural_nodes: int,
     split_text_nodes: int,
     min_area_ratio: float,
+    absolute_x: float = 0.0,
+    absolute_y: float = 0.0,
 ) -> dict[str, Any]:
     split, metrics, reasons = should_split_node(
         node,
@@ -354,6 +386,7 @@ def build_chunk_tree(
         split_text_nodes=split_text_nodes,
         min_area_ratio=min_area_ratio,
     )
+    metrics["absoluteBounds"] = node_box_absolute(node, absolute_x, absolute_y)
     tree = {
         "id": str(node.get("id") or ""),
         "name": str(node.get("name") or ""),
@@ -391,20 +424,21 @@ def build_chunk_tree(
             split_structural_nodes=split_structural_nodes,
             split_text_nodes=split_text_nodes,
             min_area_ratio=min_area_ratio,
+            absolute_x=absolute_x + node_box(child.node)[0],
+            absolute_y=absolute_y + node_box(child.node)[1],
         )
         for child in direct_children
     ]
     return tree
 
 
-def collect_leaf_tree_nodes(tree: dict[str, Any]) -> list[dict[str, Any]]:
-    children = tree.get("children") or []
-    if not children:
-        return [tree]
-    leaves: list[dict[str, Any]] = []
-    for child in children:
-        leaves.extend(collect_leaf_tree_nodes(child))
-    return leaves
+def zero_chunk_root(node: dict[str, Any]) -> dict[str, Any]:
+    cloned = copy.deepcopy(node)
+    layout = copy.deepcopy(cloned.get("layoutStyle") or {})
+    layout["relativeX"] = 0
+    layout["relativeY"] = 0
+    cloned["layoutStyle"] = layout
+    return cloned
 
 
 def lookup_node_by_path(root: dict[str, Any], path: str) -> dict[str, Any]:
@@ -419,15 +453,20 @@ def lookup_node_by_path(root: dict[str, Any], path: str) -> dict[str, Any]:
 def chunk_summary(candidate: Candidate, index: int) -> dict[str, Any]:
     node = candidate.node
     descendants = count_descendants(node)
+    absolute_bounds = candidate.absolute_bounds or node_box(node)
+    relative_bounds = node_box(node)
     summary = {
         "index": index,
         "id": str(node.get("id") or ""),
         "name": str(node.get("name") or ""),
         "type": str(node.get("type") or ""),
+        "kind": candidate.kind,
         "depth": candidate.depth,
         "path": candidate.path,
         "score": candidate.score,
-        "bounds": node_box(node),
+        "bounds": relative_bounds,
+        "absoluteBounds": absolute_bounds,
+        "normalizedBounds": [0, 0, relative_bounds[2], relative_bounds[3]],
         "childCount": len(node.get("children") or []),
         "descendantCount": descendants,
         "maxDepth": max_depth(node),
@@ -451,7 +490,7 @@ def write_chunk_files(
     chunks_dir.mkdir(parents=True, exist_ok=True)
 
     for index, candidate in enumerate(selected, start=1):
-        node = copy.deepcopy(candidate.node)
+        node = zero_chunk_root(candidate.node)
         name = str(node.get("name") or f"chunk-{index}")
         node_id = str(node.get("id") or f"chunk-{index}").replace(":", "-")
         filename = f"{index:03d}-{slugify(name, node_id)}-{node_id}.json"
@@ -467,6 +506,109 @@ def write_chunk_files(
         entry["file"] = str(chunk_path).replace("\\", "/")
         chunk_entries.append(entry)
     return chunk_entries
+
+
+def build_render_chunks(
+    node: dict[str, Any],
+    *,
+    path: str,
+    depth: int,
+    absolute_x: float,
+    absolute_y: float,
+    root_box: list[float],
+    min_descendants: int,
+    split_descendants: int,
+    split_paths: int,
+    split_children: int,
+    split_depth: int,
+    split_structural_nodes: int,
+    split_text_nodes: int,
+    min_area_ratio: float,
+) -> list[Candidate]:
+    split, _, _ = should_split_node(
+        node,
+        depth=depth,
+        root_box=root_box,
+        min_descendants=min_descendants,
+        split_descendants=split_descendants,
+        split_paths=split_paths,
+        split_children=split_children,
+        split_depth=split_depth,
+        split_structural_nodes=split_structural_nodes,
+        split_text_nodes=split_text_nodes,
+        min_area_ratio=min_area_ratio,
+    )
+    if not split:
+        _, _, width, height = node_box(node)
+        return [
+            Candidate(
+                node=node,
+                depth=depth,
+                path=path,
+                score=structural_score(node, depth),
+                kind="leaf",
+                absolute_bounds=[absolute_x, absolute_y, width, height],
+            )
+        ]
+
+    direct_children = select_direct_children(node, path, min_descendants)
+    if not direct_children:
+        _, _, width, height = node_box(node)
+        return [
+            Candidate(
+                node=node,
+                depth=depth,
+                path=path,
+                score=structural_score(node, depth),
+                kind="leaf",
+                absolute_bounds=[absolute_x, absolute_y, width, height],
+            )
+        ]
+
+    selected_paths = {item.path for item in direct_children}
+    residual_children = [
+        child
+        for index, child in enumerate(node.get("children") or [])
+        if f"{path}/children[{index}]" not in selected_paths
+    ]
+
+    chunks: list[Candidate] = []
+    if has_visual_payload(node) or residual_children:
+        base_node = copy.deepcopy(node)
+        base_node["children"] = residual_children
+        _, _, width, height = node_box(node)
+        chunks.append(
+            Candidate(
+                node=base_node,
+                depth=depth,
+                path=path,
+                score=structural_score(node, depth),
+                kind="base",
+                absolute_bounds=[absolute_x, absolute_y, width, height],
+            )
+        )
+
+    for child in direct_children:
+        child_x, child_y, _, _ = node_box(child.node)
+        chunks.extend(
+            build_render_chunks(
+                child.node,
+                path=child.path,
+                depth=depth + 1,
+                absolute_x=absolute_x + child_x,
+                absolute_y=absolute_y + child_y,
+                root_box=root_box,
+                min_descendants=min_descendants,
+                split_descendants=split_descendants,
+                split_paths=split_paths,
+                split_children=split_children,
+                split_depth=split_depth,
+                split_structural_nodes=split_structural_nodes,
+                split_text_nodes=split_text_nodes,
+                min_area_ratio=min_area_ratio,
+            )
+        )
+    return chunks
 
 
 def render_markdown(
@@ -564,21 +706,23 @@ def main() -> None:
         split_text_nodes=args.split_text_nodes,
         min_area_ratio=args.min_area_ratio,
     )
-    leaf_tree_nodes = [
-        node
-        for node in collect_leaf_tree_nodes(chunk_tree)
-        if node.get("path") != "roots[0]"
-    ]
-    leaf_candidates = [
-        Candidate(
-            node=lookup_node_by_path(root, leaf["path"]),
-            depth=int(leaf["depth"]),
-            path=str(leaf["path"]),
-            score=int(leaf["score"]),
-        )
-        for leaf in leaf_tree_nodes
-    ]
-    chunk_entries = write_chunk_files(source, leaf_candidates, out_dir)
+    render_candidates = build_render_chunks(
+        root,
+        path="roots[0]",
+        depth=0,
+        absolute_x=0.0,
+        absolute_y=0.0,
+        root_box=root_box,
+        min_descendants=args.min_descendants,
+        split_descendants=args.split_descendants,
+        split_paths=args.split_paths,
+        split_children=args.split_children,
+        split_depth=args.split_depth,
+        split_structural_nodes=args.split_structural_nodes,
+        split_text_nodes=args.split_text_nodes,
+        min_area_ratio=args.min_area_ratio,
+    )
+    chunk_entries = write_chunk_files(source, render_candidates, out_dir)
     candidate_entries = [
         chunk_summary(candidate, index)
         for index, candidate in enumerate(
@@ -602,6 +746,7 @@ def main() -> None:
             "splitTextNodes": args.split_text_nodes,
             "minAreaRatio": args.min_area_ratio,
             "selectedChunkCount": len(chunk_entries),
+            "renderChunkCount": len(chunk_entries),
             "candidateChunkCount": len(all_candidates),
         },
         "rootSummary": {
@@ -617,9 +762,9 @@ def main() -> None:
     write_json(
         out_dir / "leaf-chunks.manifest.json",
         {
-            "version": "mastergo2html.raw-dsl-leaf-chunks.v1",
-            "meta": manifest["meta"],
-            "chunks": chunk_entries,
+        "version": "mastergo2html.raw-dsl-render-chunks.v2",
+        "meta": manifest["meta"],
+        "chunks": chunk_entries,
         },
         pretty=True,
     )

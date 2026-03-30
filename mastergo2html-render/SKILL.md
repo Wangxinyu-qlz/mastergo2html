@@ -8,7 +8,7 @@ user-invocable: true
 
 `render` 阶段现在只执行 plan，不做公共层语义推断和组件专项样式推断。
 
-如果复杂页面已经先做了递归分块，优先按叶子块逐块 render：
+如果复杂页面已经先做了递归分块，优先按 render chunks 逐块 render：
 
 ```bash
 python3 skill/mastergo2htmlV3/scripts/run_chunk_pipeline.py \
@@ -30,6 +30,12 @@ python3 skill/mastergo2htmlV3/scripts/run_chunk_pipeline.py \
 - `<prototype_dir>/dsl_chunks/runs/<chunk>/render.plan.json`
 - `<prototype_dir>/dsl_chunks/runs/<chunk>/output/index.html`
 - `<prototype_dir>/output/assembled.html`
+
+其中：
+
+- `leaf` chunk 渲染复杂子树本体
+- `base` chunk 渲染父层背景、容器和未下钻的剩余节点
+- `assembled.html` 会把各 chunk 的 HTML 片段内联组装，不使用 `iframe`
 
 如果需要只做组装，不重跑各块渲染，可以单独执行：
 

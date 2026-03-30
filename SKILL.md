@@ -32,7 +32,7 @@ version: 3.1.0
 3. `python3 skill/mastergo2htmlV3/scripts/split_raw_dsl_into_chunks.py <prototype_dir>/dsl_raw.json -o <prototype_dir>/dsl_chunks`
 4. `python3 skill/mastergo2htmlV3/scripts/run_chunk_pipeline.py <prototype_dir> --mode hifi`
 
-其中第 4 步会对 `leaf-chunks.manifest.json` 中的叶子块逐块执行：
+其中第 4 步会基于 `leaf-chunks.manifest.json` 中的 render chunks 逐块执行：
 
 - `compress`
 - `structure`
@@ -40,6 +40,13 @@ version: 3.1.0
 - `plan`
 - `render`
 - `assemble`
+
+render chunks 不再是单纯的 leaf-only：
+
+- `leaf` chunk：复杂子树本体
+- `base` chunk：被 split 父节点保留下来的基础层、背景层、剩余子节点
+
+`assemble` 阶段不再使用 `iframe`，而是按 `absoluteBounds` 把各 chunk 的 DOM 片段内联回整页。
 
 产物集中写入：
 
