@@ -1,0 +1,56 @@
+{
+  "version": "mastergo2html.direction-rules.v1",
+  "description": "Model-authored rules for deriving directional facts from extracted sources.",
+  "directionRules": [
+    {
+      "ruleId": "instance-right-single",
+      "priority": 100,
+      "field": "instanceName",
+      "match": {
+        "containsAll": ["图标", "右"],
+        "excludesAny": ["双右", "double-right", "双左", "double-left"]
+      },
+      "assign": {
+        "direction": "right",
+        "variant": "single"
+      }
+    },
+    {
+      "ruleId": "instance-left-single",
+      "priority": 100,
+      "field": "instanceName",
+      "match": {
+        "containsAll": ["图标", "左"],
+        "excludesAny": ["双右", "double-right", "双左", "double-left"]
+      },
+      "assign": {
+        "direction": "left",
+        "variant": "single"
+      }
+    },
+    {
+      "ruleId": "child-double-right",
+      "priority": 90,
+      "field": "childNames",
+      "match": {
+        "containsAny": ["双右", "double-right"]
+      },
+      "assign": {
+        "direction": "right",
+        "variant": "double"
+      }
+    },
+    {
+      "ruleId": "child-double-left",
+      "priority": 90,
+      "field": "childNames",
+      "match": {
+        "containsAny": ["双左", "double-left"]
+      },
+      "assign": {
+        "direction": "left",
+        "variant": "double"
+      }
+    }
+  ]
+}
