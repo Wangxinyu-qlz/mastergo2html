@@ -55,6 +55,12 @@ def sanitize_css_value(value: str) -> str:
     return value.replace("NaN%", "0%").replace("NaN", "0")
 
 
+def _get_style(node: dict[str, Any], key: str) -> Any:
+    if key in node:
+        return node.get(key)
+    return (node.get("style") or {}).get(key)
+
+
 def split_css_args(value: str) -> list[str]:
     parts: list[str] = []
     current: list[str] = []
@@ -155,6 +161,32 @@ def parse_radial_gradient(value: str) -> tuple[dict[str, str], list[tuple[str, s
             color = stop.strip()
         stops.append((color, offset))
     return attrs, stops
+
+
+def parse_length_or_percent(value: str, start: float, length: float) -> float:
+    text = str(value or "").strip()
+    if text.endswith("%"):
+        try:
+            return start + length * float(text[:-1]) / 100.0
+        except ValueError:
+            return start
+    try:
+        return float(text)
+    except ValueError:
+        return start
+
+
+def radial_radius_to_user_space(value: str, width: float, height: float) -> float:
+    text = str(value or "").strip()
+    if text.endswith("%"):
+        try:
+            return max(width, height) * float(text[:-1]) / 100.0
+        except ValueError:
+            return max(width, height)
+    try:
+        return float(text)
+    except ValueError:
+        return max(width, height)
 
 
 def flatten_box_shadow(effect_values: list[str]) -> list[str]:
@@ -363,6 +395,15 @@ body {{
     def get_children(self, node: dict[str, Any]) -> list[dict[str, Any]]:
         return node.get("children", []) or []
 
+    def is_alpha_mask_node(self, node: dict[str, Any]) -> bool:
+        return str(_get_style(node, "mask") or "").strip().lower() == "alpha"
+
+    def get_mask_nodes(self, node: dict[str, Any]) -> list[dict[str, Any]]:
+        return [child for child in self.get_children(node) if self.is_alpha_mask_node(child)]
+
+    def get_render_children(self, node: dict[str, Any]) -> list[dict[str, Any]]:
+        return [child for child in self.get_children(node) if not self.is_alpha_mask_node(child)]
+
     def get_node_id(self, node: dict[str, Any]) -> str:
         return str(node.get("id", ""))
 
@@ -407,6 +448,69 @@ body {{
 
         return all(walk(child) for child in children) and vector_leaf_count > 0
 
+    def get_svg_bounds(self, node: dict[str, Any], d_values: list[str] | None = None) -> tuple[float, float, float, float]:
+        if d_values:
+            bounds = [path_bounds_from_d(d) for d in d_values]
+            bounds = [item for item in bounds if item is not None]
+            if bounds:
+                min_x = min(item[0] for item in bounds)
+                min_y = min(item[1] for item in bounds)
+                max_x = max(item[0] + item[2] for item in bounds)
+                max_y = max(item[1] + item[3] for item in bounds)
+                return min_x, min_y, max(max_x - min_x, 1.0), max(max_y - min_y, 1.0)
+        x, y, w, h = node.get("box", [0, 0, 0, 0])
+        return float(x or 0), float(y or 0), max(float(w or 0), 1.0), max(float(h or 0), 1.0)
+
+    def build_svg_paint_ref(
+        self,
+        *,
+        node_id: str,
+        defs: list[str],
+        fill: str,
+        gradient_id: str,
+        bounds: tuple[float, float, float, float],
+    ) -> str:
+        fill = fill.strip()
+        min_x, min_y, width, height = bounds
+        if fill.startswith("linear-gradient("):
+            parsed = parse_linear_gradient(fill)
+            if not parsed:
+                return "#8DD2FF"
+            attrs, stops = parsed
+            x1 = parse_length_or_percent(attrs["x1"], min_x, width)
+            y1 = parse_length_or_percent(attrs["y1"], min_y, height)
+            x2 = parse_length_or_percent(attrs["x2"], min_x, width)
+            y2 = parse_length_or_percent(attrs["y2"], min_y, height)
+            stop_markup = "".join(
+                f'<stop offset="{escape_attr(offset)}" stop-color="{escape_attr(color)}"></stop>'
+                for color, offset in stops
+            )
+            defs.append(
+                f'<linearGradient id="{escape_attr(gradient_id)}" gradientUnits="userSpaceOnUse" '
+                f'x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}">{stop_markup}</linearGradient>'
+            )
+            return f"url(#{gradient_id})"
+        if fill.startswith("radial-gradient("):
+            parsed = parse_radial_gradient(fill)
+            if not parsed:
+                return "transparent"
+            attrs, stops = parsed
+            cx = parse_length_or_percent(attrs["cx"], min_x, width)
+            cy = parse_length_or_percent(attrs["cy"], min_y, height)
+            fx = parse_length_or_percent(attrs["fx"], min_x, width)
+            fy = parse_length_or_percent(attrs["fy"], min_y, height)
+            r = radial_radius_to_user_space(attrs["r"], width, height)
+            stop_markup = "".join(
+                f'<stop offset="{escape_attr(offset)}" stop-color="{escape_attr(color)}"></stop>'
+                for color, offset in stops
+            )
+            defs.append(
+                f'<radialGradient id="{escape_attr(gradient_id)}" gradientUnits="userSpaceOnUse" '
+                f'cx="{cx}" cy="{cy}" r="{r}" fx="{fx}" fy="{fy}">{stop_markup}</radialGradient>'
+            )
+            return f"url(#{gradient_id})"
+        return fill
+
     def build_shape_fill_markup(
         self,
         *,
@@ -415,45 +519,22 @@ body {{
         defs: list[str],
         segment_index: int,
         fill_values: list[str],
+        bounds: tuple[float, float, float, float] | None = None,
     ) -> list[str]:
         node_id = self.get_node_id(node) or "node"
+        paint_bounds = bounds or self.get_svg_bounds(node)
         rendered: list[str] = []
         for fill_index, fill_value in enumerate(fill_values):
-            fill = fill_value.strip()
-            if fill.startswith("linear-gradient("):
-                parsed = parse_linear_gradient(fill)
-                if parsed:
-                    gradient_id = f"{node_id}-grad-{segment_index}-{fill_index}"
-                    attrs, stops = parsed
-                    stop_markup = "".join(
-                        f'<stop offset="{escape_attr(offset)}" stop-color="{escape_attr(color)}"></stop>'
-                        for color, offset in stops
-                    )
-                    defs.append(
-                        f'<linearGradient id="{escape_attr(gradient_id)}" '
-                        f'x1="{attrs["x1"]}" y1="{attrs["y1"]}" x2="{attrs["x2"]}" y2="{attrs["y2"]}">{stop_markup}</linearGradient>'
-                    )
-                    fill = f"url(#{gradient_id})"
-                else:
-                    fill = "#8DD2FF"
-            elif fill.startswith("radial-gradient("):
-                parsed = parse_radial_gradient(fill)
-                if parsed:
-                    gradient_id = f"{node_id}-grad-{segment_index}-{fill_index}"
-                    attrs, stops = parsed
-                    stop_markup = "".join(
-                        f'<stop offset="{escape_attr(offset)}" stop-color="{escape_attr(color)}"></stop>'
-                        for color, offset in stops
-                    )
-                    defs.append(
-                        f'<radialGradient id="{escape_attr(gradient_id)}" '
-                        f'cx="{attrs["cx"]}" cy="{attrs["cy"]}" r="{attrs["r"]}" '
-                        f'fx="{attrs["fx"]}" fy="{attrs["fy"]}">{stop_markup}</radialGradient>'
-                    )
-                    fill = f"url(#{gradient_id})"
-                else:
-                    fill = "transparent"
-            rendered.append(fill)
+            gradient_id = f"{node_id}-grad-{segment_index}-{fill_index}"
+            rendered.append(
+                self.build_svg_paint_ref(
+                    node_id=node_id,
+                    defs=defs,
+                    fill=fill_value,
+                    gradient_id=gradient_id,
+                    bounds=paint_bounds,
+                )
+            )
         return rendered
 
     def should_merge_group_as_svg(self, node: dict[str, Any], data: dict[str, Any]) -> bool:
@@ -684,12 +765,16 @@ body {{
                 if axis in {"y", "both"}:
                     y = (float(ph or 0) - float(h or 0)) / 2.0
         lines = [f'[data-node-id="{node_id}"] {{']
+        if self.is_alpha_mask_node(node):
+            lines.append("  display: none;")
+            lines.append("}")
+            return "\n".join(lines)
         lines.append(f"  left: {append_px(x)};")
         lines.append(f"  top: {append_px(y)};")
         lines.append(f"  width: {append_px(w)};")
         lines.append(f"  height: {append_px(h)};")
 
-        fills = self.resolve_fill_list(data, node.get("fill"))
+        fills = self.resolve_fill_list(data, _get_style(node, "fill"))
         if fills:
             image_layers = [value for value in fills if value.startswith("url(")]
             if image_layers:
@@ -701,23 +786,24 @@ body {{
             if gradient_layers and self.get_node_kind(node) != "text":
                 lines.append(f"  background: {', '.join(gradient_layers)};")
 
-        radius = node.get("radius")
+        radius = _get_style(node, "radius")
         if radius is not None:
             lines.append(f"  border-radius: {radius};")
 
         style = node.get("style") or {}
-        if style.get("opacity") not in (None, ""):
-            lines.append(f"  opacity: {style['opacity']};")
-        stroke_color = self.resolve_fill_list(data, style.get("strokeColor"))
-        stroke_width = style.get("strokeWidth")
+        opacity = _get_style(node, "opacity")
+        if opacity not in (None, ""):
+            lines.append(f"  opacity: {opacity};")
+        stroke_color = self.resolve_fill_list(data, _get_style(node, "strokeColor"))
+        stroke_width = _get_style(node, "strokeWidth")
         if stroke_color and stroke_width not in (None, "", 0, "0"):
             lines.append(
-                f"  border: {stroke_width} {style.get('strokeType', 'solid')} {stroke_color[0]};"
+                f"  border: {stroke_width} {_get_style(node, 'strokeType') or 'solid'} {stroke_color[0]};"
             )
-            if style.get("strokeAlign") == "inside":
+            if _get_style(node, "strokeAlign") == "inside":
                 lines.append(f"  box-shadow: inset 0 0 0 {stroke_width} {stroke_color[0]};")
 
-        effect_token = style.get("effect")
+        effect_token = _get_style(node, "effect")
         if effect_token and self.should_apply_effect(node, data):
             lines.extend(
                 f"  {rule}" for rule in flatten_box_shadow(self.resolve_effect(data, effect_token))
@@ -732,6 +818,47 @@ body {{
 
         lines.append("}")
         return "\n".join(lines)
+
+    def build_alpha_mask_css(self, node: dict[str, Any], data: dict[str, Any]) -> list[str]:
+        mask_nodes = self.get_mask_nodes(node)
+        if not mask_nodes:
+            return []
+        mask = mask_nodes[0]
+        kind = self.get_node_kind(mask)
+        x, y, w, h = mask.get("box", [0, 0, 0, 0])
+        lines = ["  overflow: hidden;"]
+        if kind == "svg_ellipse":
+            cx = float(x or 0) + float(w or 0) / 2.0
+            cy = float(y or 0) + float(h or 0) / 2.0
+            rx = max(float(w or 0) / 2.0, 0.0)
+            ry = max(float(h or 0) / 2.0, 0.0)
+            lines.append(f"  clip-path: ellipse({append_px(rx)} {append_px(ry)} at {append_px(cx)} {append_px(cy)});")
+            lines.append(
+                f"  -webkit-clip-path: ellipse({append_px(rx)} {append_px(ry)} at {append_px(cx)} {append_px(cy)});"
+            )
+            return lines
+        if kind in {"layer", "frame", "group", "instance"} and not self.has_vector(mask):
+            top = max(float(y or 0), 0.0)
+            left = max(float(x or 0), 0.0)
+            right = max(float(node.get('box', [0, 0, 0, 0])[2] or 0) - (float(x or 0) + float(w or 0)), 0.0)
+            bottom = max(float(node.get('box', [0, 0, 0, 0])[3] or 0) - (float(y or 0) + float(h or 0)), 0.0)
+            radius = _get_style(mask, "radius")
+            if radius is not None:
+                lines.append(
+                    f"  clip-path: inset({append_px(top)} {append_px(right)} {append_px(bottom)} {append_px(left)} round {radius});"
+                )
+                lines.append(
+                    f"  -webkit-clip-path: inset({append_px(top)} {append_px(right)} {append_px(bottom)} {append_px(left)} round {radius});"
+                )
+            elif top or right or bottom or left:
+                lines.append(
+                    f"  clip-path: inset({append_px(top)} {append_px(right)} {append_px(bottom)} {append_px(left)});"
+                )
+                lines.append(
+                    f"  -webkit-clip-path: inset({append_px(top)} {append_px(right)} {append_px(bottom)} {append_px(left)});"
+                )
+            return lines
+        return lines
 
     def collect_relative_boxes(
         self,
@@ -915,49 +1042,39 @@ body {{
         min_x, min_y, view_width, view_height = self.get_vector_view_box(node, data)
         paths: list[str] = []
         defs: list[str] = []
+        grouped_segments: dict[str, list[tuple[int, str, list[str]]]] = {}
+        segment_order: list[str] = []
         for segment_index, segment in enumerate(vector.get("segments", [])):
             if self.skip_vector_segment(node, data, segment_index, segment):
                 continue
-            d = escape_attr(segment.get("d", ""))
+            raw_d = str(segment.get("d") or "")
             path_attrs = self.get_vector_path_attrs(node, data, segment_index, segment)
-            extra_attrs = f" {' '.join(path_attrs)}" if path_attrs else ""
             fill_values = self.resolve_fill_list(data, segment.get("fill")) or ["transparent"]
-            for fill_index, fill_value in enumerate(fill_values):
-                fill = fill_value.strip()
-                if fill.startswith("linear-gradient("):
-                    parsed = parse_linear_gradient(fill)
-                    if parsed:
-                        gradient_id = f'{self.get_node_id(node) or "node"}-grad-{segment_index}-{fill_index}'
-                        attrs, stops = parsed
-                        stop_markup = "".join(
-                            f'<stop offset="{escape_attr(offset)}" stop-color="{escape_attr(color)}"></stop>'
-                            for color, offset in stops
-                        )
-                        defs.append(
-                            f'<linearGradient id="{escape_attr(gradient_id)}" '
-                            f'x1="{attrs["x1"]}" y1="{attrs["y1"]}" x2="{attrs["x2"]}" y2="{attrs["y2"]}">{stop_markup}</linearGradient>'
-                        )
-                        fill = f"url(#{gradient_id})"
-                    else:
-                        fill = "#8DD2FF"
-                elif fill.startswith("radial-gradient("):
-                    parsed = parse_radial_gradient(fill)
-                    if parsed:
-                        gradient_id = f'{self.get_node_id(node) or "node"}-grad-{segment_index}-{fill_index}'
-                        attrs, stops = parsed
-                        stop_markup = "".join(
-                            f'<stop offset="{escape_attr(offset)}" stop-color="{escape_attr(color)}"></stop>'
-                            for color, offset in stops
-                        )
-                        defs.append(
-                            f'<radialGradient id="{escape_attr(gradient_id)}" '
-                            f'cx="{attrs["cx"]}" cy="{attrs["cy"]}" r="{attrs["r"]}" '
-                            f'fx="{attrs["fx"]}" fy="{attrs["fy"]}">{stop_markup}</radialGradient>'
-                        )
-                        fill = f"url(#{gradient_id})"
-                    else:
-                        fill = "transparent"
-                paths.append(f'<path d="{d}" fill="{escape_attr(fill)}"{extra_attrs}></path>')
+            group_key = json.dumps({"fill": fill_values, "attrs": path_attrs}, ensure_ascii=False, sort_keys=True)
+            if group_key not in grouped_segments:
+                grouped_segments[group_key] = []
+                segment_order.append(group_key)
+            grouped_segments[group_key].append((segment_index, raw_d, path_attrs))
+        for group_key in segment_order:
+            items = grouped_segments[group_key]
+            segment_index = items[0][0]
+            d_values = [item[1] for item in items if item[1]]
+            path_attrs = items[0][2]
+            extra_attrs = f" {' '.join(path_attrs)}" if path_attrs else ""
+            d = escape_attr(" ".join(d_values))
+            fill_values = json.loads(group_key)["fill"] or ["transparent"]
+            bounds = self.get_svg_bounds(node, d_values)
+            for fill in self.build_shape_fill_markup(
+                node=node,
+                data=data,
+                defs=defs,
+                segment_index=segment_index,
+                fill_values=fill_values,
+                bounds=bounds,
+            ):
+                paths.append(
+                    f'<path d="{d}" fill="{escape_attr(fill)}" fill-rule="evenodd" clip-rule="evenodd"{extra_attrs}></path>'
+                )
         defs_markup = f'<defs>{"".join(defs)}</defs>' if defs else ""
         return (
             f'<svg viewBox="{min_x} {min_y} {view_width} {view_height}" xmlns="http://www.w3.org/2000/svg" '
@@ -983,27 +1100,37 @@ body {{
         return 0.0, 0.0, max(float(width or 0), 1.0), max(float(height or 0), 1.0)
 
     def build_svg_filter_markup(self, filter_id: str, effect_values: list[str]) -> str:
-        shadows = []
+        lines = [
+            f'<filter id="{escape_attr(filter_id)}" filterUnits="userSpaceOnUse" '
+            'color-interpolation-filters="sRGB" x="-100%" y="-100%" width="300%" height="300%">'
+        ]
+        has_effect = False
+        blend_input = "SourceGraphic"
+        inset_index = 0
+        shadow_index = 0
         for raw in effect_values:
             if ":" not in raw:
                 continue
             prop, value = raw.split(":", 1)
-            if prop.strip() != "box-shadow":
+            prop = prop.strip()
+            value = value.strip().rstrip(";")
+            if prop in {"filter", "backdrop-filter"} and "blur" in value:
+                match = re.search(r"blur\(([\d\.]+)px\)", value)
+                if match:
+                    std_dev = max(float(match.group(1)) / 2.0, 0.001)
+                    lines.append(
+                        f'<feGaussianBlur in="{blend_input}" stdDeviation="{std_dev}" result="blur_{shadow_index}"/>'
+                    )
+                    blend_input = f"blur_{shadow_index}"
+                    has_effect = True
+                    shadow_index += 1
                 continue
-            parsed = parse_box_shadow(value.strip().rstrip(";"))
-            if parsed:
-                shadows.append(parsed)
-        if not shadows:
-            return ""
-
-        lines = [
-            f'<filter id="{escape_attr(filter_id)}" filterUnits="userSpaceOnUse" '
-            'color-interpolation-filters="sRGB" x="-32" y="-32" width="200%" height="200%">'
-        ]
-        blend_input = "SourceGraphic"
-        inset_index = 0
-        shadow_index = 0
-        for shadow in shadows:
+            if prop != "box-shadow":
+                continue
+            shadow = parse_box_shadow(value)
+            if not shadow:
+                continue
+            has_effect = True
             color_matrix = rgba_to_matrix_values(str(shadow["color"]))
             std_dev = max(float(shadow["blur"]) / 2.0, 0.001)
             dx = float(shadow["x"])
@@ -1012,7 +1139,7 @@ body {{
                 inset_index += 1
                 lines.extend(
                     [
-                        '<feColorMatrix in="SourceAlpha" type="matrix" result="hardAlpha" '
+                        f'<feColorMatrix in="{blend_input}" type="matrix" result="hardAlpha" '
                         'values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0"/>',
                         f'<feOffset dx="{dx}" dy="{dy}"/>',
                         f'<feGaussianBlur stdDeviation="{std_dev}"/>',
@@ -1024,13 +1151,15 @@ body {{
                 blend_input = f"effect{inset_index}_innerShadow"
             else:
                 shadow_index += 1
-                lines.extend(
-                    [
-                        f'<feDropShadow dx="{dx}" dy="{dy}" stdDeviation="{std_dev}" flood-color="{escape_attr(str(shadow["color"]))}" flood-opacity="{color_to_rgba(str(shadow["color"]))[3]}" result="effect{shadow_index}_dropShadow"/>',
-                        f'<feBlend mode="normal" in="{blend_input}" in2="effect{shadow_index}_dropShadow" result="effect{shadow_index}_shadowBlend"/>',
-                    ]
+                lines.append(
+                    f'<feDropShadow in="{blend_input}" dx="{dx}" dy="{dy}" stdDeviation="{std_dev}" '
+                    f'flood-color="{escape_attr(str(shadow["color"]))}" '
+                    f'flood-opacity="{color_to_rgba(str(shadow["color"]))[3]}" '
+                    f'result="effect{shadow_index}_dropShadow"/>'
                 )
-                blend_input = f"effect{shadow_index}_shadowBlend"
+                blend_input = f"effect{shadow_index}_dropShadow"
+        if not has_effect:
+            return ""
         lines.append("</filter>")
         return "".join(lines)
 
@@ -1051,7 +1180,7 @@ body {{
             vector = vectors.get(node.get("vector", ""), {})
             path_markup: list[str] = []
             node_id = self.get_node_id(node) or "node"
-            effect_token = str((node.get("style") or {}).get("effect") or "")
+            effect_token = str(_get_style(node, "effect") or "")
             filter_attr = ""
             if effect_token:
                 filter_id = f"{node_id}-filter"
@@ -1059,27 +1188,45 @@ body {{
                 if filter_markup:
                     defs.append(filter_markup)
                     filter_attr = f' filter="url(#{escape_attr(filter_id)})"'
+            grouped_segments: dict[str, list[tuple[int, str, list[str]]]] = {}
+            segment_order: list[str] = []
             for segment_index, segment in enumerate(vector.get("segments", [])):
                 if self.skip_vector_segment(node, data, segment_index, segment):
                     continue
-                d = escape_attr(segment.get("d", ""))
+                raw_d = str(segment.get("d") or "")
                 path_attrs = self.get_vector_path_attrs(node, data, segment_index, segment)
                 fill_values = self.resolve_fill_list(data, segment.get("fill")) or ["transparent"]
+                group_key = json.dumps({"fill": fill_values, "attrs": path_attrs}, ensure_ascii=False, sort_keys=True)
+                if group_key not in grouped_segments:
+                    grouped_segments[group_key] = []
+                    segment_order.append(group_key)
+                grouped_segments[group_key].append((segment_index, raw_d, path_attrs))
+            for group_key in segment_order:
+                items = grouped_segments[group_key]
+                segment_index = items[0][0]
+                d_values = [item[1] for item in items if item[1]]
+                path_attrs = items[0][2]
                 extra_attrs = f" {' '.join(path_attrs)}" if path_attrs else ""
+                d = escape_attr(" ".join(d_values))
+                fill_values = json.loads(group_key)["fill"] or ["transparent"]
+                bounds = self.get_svg_bounds(node, d_values)
                 for fill in self.build_shape_fill_markup(
                     node=node,
                     data=data,
                     defs=defs,
                     segment_index=segment_index,
                     fill_values=fill_values,
+                    bounds=bounds,
                 ):
-                    path_markup.append(f'<path d="{d}" fill="{escape_attr(fill)}"{extra_attrs}></path>')
+                    path_markup.append(
+                        f'<path d="{d}" fill="{escape_attr(fill)}" fill-rule="evenodd" clip-rule="evenodd"{extra_attrs}></path>'
+                    )
             transform = f' transform="translate({local_x} {local_y})"' if local_x or local_y else ""
             return f"<g{transform}{filter_attr}>{''.join(path_markup)}</g>"
 
         if self.get_node_kind(node) == "svg_ellipse":
             node_id = self.get_node_id(node) or "node"
-            effect_token = str((node.get("style") or {}).get("effect") or "")
+            effect_token = str(_get_style(node, "effect") or "")
             filter_attr = ""
             if effect_token:
                 filter_id = f"{node_id}-filter"
@@ -1090,21 +1237,30 @@ body {{
             _, _, width, height = node.get("box", [0, 0, 0, 0])
             rx = max(float(width or 0) / 2.0, 0.0)
             ry = max(float(height or 0) / 2.0, 0.0)
-            fill_values = self.resolve_fill_list(data, node.get("fill")) or ["transparent"]
+            fill_values = self.resolve_fill_list(data, _get_style(node, "fill")) or ["transparent"]
+            ellipse_bounds = (0.0, 0.0, max(float(width or 0), 1.0), max(float(height or 0), 1.0))
             rendered_fills = self.build_shape_fill_markup(
                 node=node,
                 data=data,
                 defs=defs,
                 segment_index=0,
                 fill_values=fill_values,
+                bounds=ellipse_bounds,
             )
-            style = node.get("style") or {}
-            stroke_values = self.resolve_fill_list(data, style.get("strokeColor"))
-            stroke = stroke_values[0] if stroke_values else "none"
-            stroke_width = style.get("strokeWidth") or "0"
+            stroke_values = self.resolve_fill_list(data, _get_style(node, "strokeColor"))
+            rendered_strokes = self.build_shape_fill_markup(
+                node=node,
+                data=data,
+                defs=defs,
+                segment_index=1,
+                fill_values=stroke_values,
+                bounds=ellipse_bounds,
+            ) if stroke_values else []
+            stroke = rendered_strokes[0] if rendered_strokes else "none"
+            stroke_width = str(_get_style(node, "strokeWidth") or "0").replace("px", "")
             ellipses = [
                 f'<ellipse cx="{rx}" cy="{ry}" rx="{rx}" ry="{ry}" fill="{escape_attr(fill)}" '
-                f'stroke="{escape_attr(stroke)}" stroke-width="{escape_attr(str(stroke_width))}"></ellipse>'
+                f'stroke="{escape_attr(stroke)}" stroke-width="{escape_attr(stroke_width)}"></ellipse>'
                 for fill in rendered_fills
             ]
             transform = f' transform="translate({local_x} {local_y})"' if local_x or local_y else ""
@@ -1112,12 +1268,12 @@ body {{
 
         child_markup = [
             self.build_vector_group_markup(child, data, defs)
-            for child in self.get_children(node)
+            for child in self.get_render_children(node)
         ]
         child_markup = [item for item in child_markup if item]
         if not child_markup:
             return ""
-        effect_token = str((node.get("style") or {}).get("effect") or "")
+        effect_token = str(_get_style(node, "effect") or "")
         filter_attr = ""
         if effect_token:
             node_id = self.get_node_id(node) or "group"
@@ -1156,7 +1312,7 @@ body {{
                 _, _, width, height = current.get("box", [0, 0, 0, 0])
                 boxes.append((local_x, local_y, float(width or 0), float(height or 0)))
                 return
-            for child in self.get_children(current):
+            for child in self.get_render_children(current):
                 walk(child, local_x, local_y, False)
 
         walk(node, 0.0, 0.0, True)
@@ -1189,7 +1345,7 @@ body {{
         return []
 
     def node_css_overrides(self, node: dict[str, Any], data: dict[str, Any]) -> list[str]:
-        return []
+        return self.build_alpha_mask_css(node, data)
 
     def plan_css_overrides(self, node: dict[str, Any], data: dict[str, Any]) -> list[str]:
         lines: list[str] = []
@@ -1394,7 +1550,7 @@ class GenericDslHtmlRenderer:
                 node_index[node_id] = node
                 if parent_id:
                     parent_index[node_id] = parent_id
-            for child in adapter.get_children(node):
+            for child in adapter.get_render_children(node):
                 walk(child, node_id)
 
         for root in adapter.get_roots(self.data):
@@ -1445,6 +1601,8 @@ class GenericDslHtmlRenderer:
 
     def render_node(self, node: dict[str, Any], depth: int) -> str:
         indent = "  " * depth
+        if self.adapter.is_alpha_mask_node(node):
+            return ""
         attrs = self.adapter.build_attrs(node, self.data)
         classes = str(attrs.get("class", ""))
         if self.adapter.has_vector(node) or self.adapter.can_merge_group_as_svg(node, self.data):
@@ -1468,8 +1626,10 @@ class GenericDslHtmlRenderer:
         elif self.adapter.can_merge_group_as_svg(node, self.data):
             content = self.adapter.build_group_svg(node, self.data)
         else:
-            children = self.adapter.get_children(node)
+            children = self.adapter.get_render_children(node)
             if children:
                 rendered = [self.render_node(child, depth + 1) for child in children]
-                content = "\n" + "\n".join(rendered) + f"\n{indent}"
+                rendered = [item for item in rendered if item]
+                if rendered:
+                    content = "\n" + "\n".join(rendered) + f"\n{indent}"
         return f"{indent}<{tag}{attr_text}>{content}</{tag}>"

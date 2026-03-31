@@ -23,6 +23,70 @@ def format_px(value: float) -> str:
     return text if text else "0"
 
 
+def path_indices(path: str) -> list[int]:
+    return [int(item) for item in re.findall(r"children\[(\d+)\]", path or "")]
+
+
+def ancestor_chunk_path(path: str, chunk_paths: set[str]) -> str:
+    parts = re.findall(r"children\[\d+\]", path or "")
+    if not parts:
+        return path
+    prefixes = ["roots[0]"]
+    current = "roots[0]"
+    for part in parts:
+        current = f"{current}/{part}"
+        prefixes.append(current)
+    for prefix in prefixes[1:-1]:
+        if prefix in chunk_paths:
+            return prefix
+    return path
+
+
+def compute_chunk_z_index(chunk: dict[str, Any], root_bounds: list[float], chunk_paths: set[str]) -> int:
+    path = str(chunk.get("path") or "")
+    anchor_path = ancestor_chunk_path(path, chunk_paths)
+    indices = path_indices(anchor_path)
+    local_indices = path_indices(path[len(anchor_path):] if path.startswith(anchor_path) else path)
+    depth = len(indices)
+    kind = str(chunk.get("kind") or "leaf")
+    area = 0.0
+    bounds = chunk.get("absoluteBounds") or chunk.get("bounds") or [0, 0, 0, 0]
+    if len(bounds) == 4:
+        area = max(float(bounds[2] or 0), 0.0) * max(float(bounds[3] or 0), 0.0)
+    root_area = max(float(root_bounds[2] or 1), 1.0) * max(float(root_bounds[3] or 1), 1.0)
+    area_ratio = 0.0 if root_area <= 0 else area / root_area
+    is_atomic_vector = bool(chunk.get("isAtomicVectorArt"))
+    child_type_counts = chunk.get("childTypeCounts") or {}
+    path_like_types = {"PATH", "SVG_ELLIPSE", "SVG_POLYGON", "VECTOR", "LINE", "LAYER", "BOOLEAN_OPERATION"}
+    atomic_background_like = (
+        is_atomic_vector
+        and area_ratio > 0.2
+        and child_type_counts
+        and set(child_type_counts).issubset(path_like_types)
+    )
+
+    score = 0
+    score += depth * 100000
+    score += sum(index * (1000 // (position + 1)) for position, index in enumerate(indices))
+    local_weight = 1000
+    for index in local_indices:
+        score += index * local_weight
+        local_weight = max(local_weight // 100, 1)
+    if kind == "leaf":
+        score += 20000
+    else:
+        score -= 20000
+    if area_ratio < 0.08:
+        score += 40000
+    elif area_ratio < 0.2:
+        score += 18000
+    elif area_ratio > 0.6:
+        score -= 20000
+    if atomic_background_like:
+        score -= 30000
+    return score
+
+
 def resolve_root_bounds(tree: dict[str, Any]) -> list[float]:
     root = tree.get("root") or {}
     metrics = root.get("metrics") or {}
@@ -165,6 +229,7 @@ body {{
 .assembly-chunk {{
   position: absolute;
   overflow: visible;
+  isolation: isolate;
 }}
 .assembly-caption {{
   position: absolute;
@@ -272,8 +337,13 @@ def main() -> None:
     )
 
     chunk_index = build_chunk_index(chunk_manifest)
+    chunk_paths = {
+        str(chunk.get("path") or "")
+        for chunk in (chunk_manifest.get("chunks") or [])
+        if chunk.get("path")
+    }
     chunk_styles: list[str] = []
-    chunk_markup: list[str] = []
+    chunk_markup_entries: list[tuple[int, str]] = []
     missing_chunks: list[str] = []
 
     for run in pipeline_manifest.get("runs") or []:
@@ -306,13 +376,18 @@ def main() -> None:
             chunk_styles.append(style_text)
 
         label = chunk.get("name") or run.get("name") or run.get("id") or "chunk"
-        chunk_markup.append(
+        z_index = compute_chunk_z_index(chunk, root_bounds, chunk_paths)
+        chunk_markup_entries.append((
+            z_index,
             f'      <section class="assembly-chunk" data-chunk-name="{label}" '
             f'data-chunk-kind="{chunk.get("kind") or "leaf"}" '
             f'style="left:{format_px(left)}px;top:{format_px(top)}px;'
-            f'width:{format_px(width)}px;height:{format_px(height)}px;">'
+            f'width:{format_px(width)}px;height:{format_px(height)}px;z-index:{z_index};">'
             f"{body_markup}</section>"
-        )
+        ))
+
+    chunk_markup_entries.sort(key=lambda item: item[0])
+    chunk_markup = [markup for _, markup in chunk_markup_entries]
 
     html = build_html(
         prototype_name=prototype_name,
