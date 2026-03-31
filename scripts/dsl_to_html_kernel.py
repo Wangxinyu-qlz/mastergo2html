@@ -935,8 +935,11 @@ body {{
     def should_apply_effect(self, node: dict[str, Any], data: dict[str, Any]) -> bool:
         """
         判断是否应该应用效果。
-        默认返回True，由子类或adapter根据具体需求覆盖此方法。
+        读取render.plan.json中的skipEffects指令。
         """
+        node_plan = self.get_node_plan(node, data)
+        if node_plan and node_plan.get("skipEffects"):
+            return False
         return True
 
     def resolve_fill_list(self, data: dict[str, Any], token_id: str | None) -> list[str]:

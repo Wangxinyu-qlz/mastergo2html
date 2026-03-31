@@ -246,8 +246,12 @@ def build_plan(
         renderer = str(render_decision.get("renderer") or "")
         if not renderer and component_decision.get("libraryComponent"):
             renderer = "library-host"
-        if not renderer:
+
+        # 即使没有renderer，如果有skipEffects决策，也要创建node_plan
+        skip_effects = render_decision.get("skipEffects", False)
+        if not renderer and not skip_effects:
             continue
+
         html_plan = render_decision.get("html") or {}
         node_plan = {
             "nodeId": node_id,
@@ -262,6 +266,12 @@ def build_plan(
             "componentType": str(component_decision.get("componentType") or ""),
             "styleOverrides": component_decision.get("styleOverrides") or {},
         }
+
+        # 添加skipEffects指令
+        if skip_effects:
+            node_plan["skipEffects"] = True
+            node_plan["skipEffectsReason"] = str(render_decision.get("reason") or "")
+
         node_plans.append(node_plan)
         if component_decision.get("library") and component_decision.get("libraryComponent"):
             library_plans.append(

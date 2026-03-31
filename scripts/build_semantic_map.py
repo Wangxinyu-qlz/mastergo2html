@@ -43,7 +43,92 @@ def extract_direction_sources(node: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def match_rule_text(value: str, rule: dict[str, Any]) -> bool:
+def analyze_effect_decision(
+    node: dict[str, Any],
+    compressed: dict[str, Any],
+    facts: dict[str, Any],
+) -> dict[str, Any] | None:
+    """
+    分析节点的effect，决定是否应该跳过某些效果。
+    只针对 filter: blur 做智能过滤，保留 backdrop-filter 和 box-shadow。
+    """
+    effect_token = facts.get("effectToken", "")
+    if not effect_token:
+        return None
+
+    # 获取effect的实际值
+    effects = compressed.get("tokens", {}).get("effects", {})
+    effect_data = effects.get(effect_token, {})
+    effect_values = effect_data.get("value", [])
+
+    # 检查是否包含 filter: blur（不包括 backdrop-filter）
+    has_filter_blur = any(
+        "filter:" in str(v) and "blur" in str(v).lower() and "backdrop" not in str(v).lower()
+        for v in effect_values
+    )
+
+    if not has_filter_blur:
+        return None
+
+    # 获取节点信息
+    kind = facts.get("kind", "")
+    box = facts.get("box", [0, 0, 0, 0])
+    width = float(box[2]) if len(box) > 2 else 0
+    height = float(box[3]) if len(box) > 3 else 0
+
+    skip_reasons = []
+
+    # 规则1: 文字节点不应用 filter: blur
+    if kind == "text":
+        skip_reasons.append("文字节点不应有filter:blur效果")
+
+    # 规则2: 细线条（宽或高 < 2px）跳过 filter: blur
+    if width < 2 or height < 2:
+        skip_reasons.append(f"细线条元素({width:.1f}x{height:.1f}px)不应有filter:blur")
+
+    # 规则3: 细长条（长宽比 > 10）检查blur强度
+    if width > 0 and height > 0:
+        aspect_ratio = max(width, height) / min(width, height)
+        if aspect_ratio > 10:
+            for effect_str in effect_values:
+                if "filter:" in str(effect_str) and "blur" in str(effect_str).lower():
+                    import re
+                    match = re.search(r"blur\(([\d\.]+)px\)", str(effect_str))
+                    if match:
+                        blur_value = float(match.group(1))
+                        min_size = min(width, height)
+                        if blur_value >= min_size * 0.5:
+                            skip_reasons.append(
+                                f"细长条元素(比例{aspect_ratio:.1f})的blur({blur_value}px)过强"
+                            )
+
+    # 规则4: 小面积元素（< 100px²）检查blur强度
+    area = width * height
+    if area < 100:
+        for effect_str in effect_values:
+            if "filter:" in str(effect_str) and "blur" in str(effect_str).lower():
+                import re
+                match = re.search(r"blur\(([\d\.]+)px\)", str(effect_str))
+                if match:
+                    blur_value = float(match.group(1))
+                    min_size = min(width, height)
+                    if blur_value >= min_size * 0.25:
+                        skip_reasons.append(
+                            f"小元素({area:.0f}px²)的blur({blur_value}px)相对过强"
+                        )
+
+    if skip_reasons:
+        return {
+            "skipEffects": True,
+            "reason": "; ".join(skip_reasons),
+            "effectToken": effect_token,
+            "effectValues": effect_values,
+        }
+
+    return None
+
+
+
     normalized = value.lower()
     match = rule.get("match") or {}
     contains_any = [str(item).lower() for item in (match.get("containsAny") or []) if str(item)]
@@ -340,6 +425,12 @@ def build_semantic_map(
                 "iconStructureFacts": extract_icon_structure_facts(node),
             },
         }
+
+        # 分析effect并生成renderDecision
+        effect_decision = analyze_effect_decision(node, compressed, node_mapping["facts"])
+        if effect_decision:
+            node_mapping["renderDecision"] = effect_decision
+
         node_mappings.append(node_mapping)
         direction_fact = apply_direction_rules(node_mapping["facts"]["directionSources"], direction_rules)
         if direction_fact:
