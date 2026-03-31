@@ -329,6 +329,73 @@ def has_structural_children(node: dict[str, Any]) -> bool:
     return len(children) >= 3 and count_types(node, "TEXT") >= 2
 
 
+def classify_layer_tier(summary: dict[str, Any]) -> str:
+    name = str(summary.get("name") or "")
+    text_preview = str(summary.get("textPreview") or "")
+    label_text = f"{name} {text_preview}"
+    area_ratio = float(summary.get("areaRatio") or 0.0)
+    text_count = int(summary.get("textNodeCount") or 0)
+    child_count = int(summary.get("childCount") or 0)
+    vector_density = float(summary.get("vectorDensity") or 0.0)
+    is_atomic_vector = bool(summary.get("isAtomicVectorArt"))
+    child_counts = summary.get("childTypeCounts") or {}
+    vector_like_types = {
+        "PATH",
+        "SVG_ELLIPSE",
+        "SVG_POLYGON",
+        "VECTOR",
+        "LINE",
+        "LAYER",
+        "BOOLEAN_OPERATION",
+    }
+    structural_children = sum(int(child_counts.get(key) or 0) for key in ("FRAME", "GROUP"))
+    vector_child_count = sum(int(child_counts.get(key) or 0) for key in vector_like_types)
+    only_vector_like = bool(child_counts) and set(child_counts).issubset(vector_like_types)
+
+    if (
+        "背景" in label_text
+        or (is_atomic_vector and area_ratio >= 0.25 and only_vector_like)
+        or (text_count == 0 and area_ratio >= 0.6 and vector_density >= 0.7)
+    ):
+        return "background"
+
+    if (
+        "浮层" in label_text
+        or "按钮" in label_text
+        or "请选择" in label_text
+        or "主案人员" in label_text
+        or "涉案人员" in label_text
+        or "省 内" in label_text
+        or "省 外" in label_text
+    ):
+        return "overlay"
+
+    if child_count >= 12 and structural_children >= 10 and area_ratio <= 0.55 and text_count == 0:
+        return "foreground"
+
+    if (
+        area_ratio >= 0.3 and structural_children >= 3
+    ) or (
+        area_ratio >= 0.45 and child_count >= 6
+    ) or (
+        "指挥调度中心" in label_text and area_ratio >= 0.8
+    ):
+        return "scaffold"
+
+    if (
+        text_count > 0
+        or "头像" in label_text
+        or "人员" in label_text
+        or "事件" in label_text
+        or area_ratio <= 0.18
+        or (child_count >= 12 and structural_children >= 6)
+        or (vector_child_count >= 8 and area_ratio <= 0.22)
+    ):
+        return "foreground"
+
+    return "scaffold"
+
+
 def make_metrics(node: dict[str, Any], root_box: list[float], absolute_x: float, absolute_y: float) -> dict[str, Any]:
     vector_metrics = vector_subtree_metrics(node)
     return {
@@ -503,7 +570,7 @@ def lookup_node_by_path(root: dict[str, Any], path: str) -> dict[str, Any]:
     return current
 
 
-def chunk_summary(candidate: Candidate, index: int) -> dict[str, Any]:
+def chunk_summary(candidate: Candidate, index: int, root_box: list[float]) -> dict[str, Any]:
     node = candidate.node
     descendants = count_descendants(node)
     absolute_bounds = candidate.absolute_bounds or node_box(node)
@@ -532,8 +599,14 @@ def chunk_summary(candidate: Candidate, index: int) -> dict[str, Any]:
         "vectorDensity": vector_metrics["vectorDensity"],
         "isAtomicVectorArt": vector_metrics["isPureVectorArt"],
         "childTypeCounts": child_type_counts(node),
+        "areaRatio": round(
+            (max(relative_bounds[2], 0.0) * max(relative_bounds[3], 0.0))
+            / max(root_box[2] * root_box[3], 1.0),
+            5,
+        ),
         "textPreview": first_text(node),
     }
+    summary["layerTier"] = classify_layer_tier(summary)
     return summary
 
 
@@ -541,6 +614,7 @@ def write_chunk_files(
     source: dict[str, Any],
     selected: list[Candidate],
     out_dir: Path,
+    root_box: list[float],
 ) -> list[dict[str, Any]]:
     chunk_entries: list[dict[str, Any]] = []
     chunks_dir = out_dir / "chunks"
@@ -556,10 +630,10 @@ def write_chunk_files(
             "styles": source.get("styles") or {},
             "components": source.get("components") or {},
             "nodes": [node],
-            "chunkMeta": chunk_summary(candidate, index),
+            "chunkMeta": chunk_summary(candidate, index, root_box),
         }
         write_json(chunk_path, payload, pretty=True)
-        entry = chunk_summary(candidate, index)
+        entry = chunk_summary(candidate, index, root_box)
         entry["file"] = str(chunk_path).replace("\\", "/")
         chunk_entries.append(entry)
     return chunk_entries
@@ -673,6 +747,7 @@ def render_markdown(
     root: dict[str, Any],
     all_candidates: list[Candidate],
     chunk_entries: list[dict[str, Any]],
+    root_box: list[float],
 ) -> str:
     lines = [
         "# DSL Chunk Report",
@@ -689,14 +764,15 @@ def render_markdown(
         lines.append(
             f"- `{entry['index']:03d}` `{entry['type']}` `{entry['name']}` "
             f"id=`{entry['id']}` depth=`{entry['depth']}` descendants=`{entry['descendantCount']}` "
-            f"score=`{entry['score']}`"
+            f"score=`{entry['score']}` tier=`{entry['layerTier']}`"
         )
     lines.extend(["", "## Candidate Nodes", ""])
     for index, candidate in enumerate(sorted(all_candidates, key=lambda item: (item.depth, -item.score)), start=1):
-        summary = chunk_summary(candidate, index)
+        summary = chunk_summary(candidate, index, root_box)
         lines.append(
             f"- `{summary['type']}` `{summary['name']}` id=`{summary['id']}` "
-            f"path=`{summary['path']}` descendants=`{summary['descendantCount']}` score=`{summary['score']}`"
+            f"path=`{summary['path']}` descendants=`{summary['descendantCount']}` "
+            f"score=`{summary['score']}` tier=`{summary['layerTier']}`"
         )
     return "\n".join(lines) + "\n"
 
@@ -779,9 +855,9 @@ def main() -> None:
         split_text_nodes=args.split_text_nodes,
         min_area_ratio=args.min_area_ratio,
     )
-    chunk_entries = write_chunk_files(source, render_candidates, out_dir)
+    chunk_entries = write_chunk_files(source, render_candidates, out_dir, root_box)
     candidate_entries = [
-        chunk_summary(candidate, index)
+        chunk_summary(candidate, index, root_box)
         for index, candidate in enumerate(
             sorted(all_candidates, key=lambda item: (item.depth, -item.score)),
             start=1,
@@ -835,7 +911,7 @@ def main() -> None:
         pretty=True,
     )
     (out_dir / "chunks.md").write_text(
-        render_markdown(args.input, root, all_candidates, chunk_entries),
+        render_markdown(args.input, root, all_candidates, chunk_entries, root_box),
         encoding="utf-8",
     )
     print(

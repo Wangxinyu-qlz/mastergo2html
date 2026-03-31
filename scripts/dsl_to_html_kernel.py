@@ -826,7 +826,11 @@ body {{
         mask = mask_nodes[0]
         kind = self.get_node_kind(mask)
         x, y, w, h = mask.get("box", [0, 0, 0, 0])
-        lines = ["  overflow: hidden;"]
+
+        # 只在必要时添加overflow: hidden
+        # 对于某些情况（如头像容器），overflow: hidden可能会遮挡内容
+        lines = []
+
         if kind == "svg_ellipse":
             cx = float(x or 0) + float(w or 0) / 2.0
             cy = float(y or 0) + float(h or 0) / 2.0
@@ -929,6 +933,65 @@ body {{
         return [rule for rule in rules if rule]
 
     def should_apply_effect(self, node: dict[str, Any], data: dict[str, Any]) -> bool:
+        """
+        智能判断是否应该应用效果。
+        只过滤 filter: blur，保留 backdrop-filter: blur（毛玻璃效果）和 box-shadow。
+        """
+        effect_token = _get_style(node, "effect")
+        if not effect_token:
+            return True
+
+        effect_values = self.resolve_effect(data, effect_token)
+
+        # 检查是否包含 filter: blur（不包括 backdrop-filter）
+        has_filter_blur = any(
+            "filter:" in str(v) and "blur" in str(v).lower() and "backdrop" not in str(v).lower()
+            for v in effect_values
+        )
+        if not has_filter_blur:
+            return True
+
+        # 文字节点不应用 filter: blur 效果（会导致文字模糊/阴影）
+        if self.get_node_kind(node) == "text":
+            return False
+
+        # 获取节点尺寸
+        box = node.get("box", [0, 0, 0, 0])
+        width = float(box[2] or 0)
+        height = float(box[3] or 0)
+
+        # 对于小尺寸元素（特别是细线条），跳过 filter: blur 效果
+        if width < 2 or height < 2:
+            return False
+
+        # 对于细长条（长宽比>10），即使面积较大也要检查blur
+        aspect_ratio = max(width, height) / max(min(width, height), 0.1)
+        if aspect_ratio > 10:
+            for effect_str in effect_values:
+                if "filter:" in str(effect_str) and "blur" in str(effect_str).lower() and "backdrop" not in str(effect_str).lower():
+                    import re
+                    match = re.search(r"blur\(([\d\.]+)px\)", str(effect_str))
+                    if match:
+                        blur_value = float(match.group(1))
+                        min_size = min(width, height)
+                        # 对于细长条，如果blur >= 最小尺寸的50%，跳过
+                        if blur_value >= min_size * 0.5:
+                            return False
+
+        # 对于小面积元素（< 100px²），检查blur强度
+        area = width * height
+        if area < 100:
+            for effect_str in effect_values:
+                if "filter:" in str(effect_str) and "blur" in str(effect_str).lower() and "backdrop" not in str(effect_str).lower():
+                    import re
+                    match = re.search(r"blur\(([\d\.]+)px\)", str(effect_str))
+                    if match:
+                        blur_value = float(match.group(1))
+                        min_size = min(width, height)
+                        # 如果blur值 >= 元素最小尺寸的25%，跳过
+                        if blur_value >= min_size * 0.25:
+                            return False
+
         return True
 
     def resolve_fill_list(self, data: dict[str, Any], token_id: str | None) -> list[str]:
@@ -1078,7 +1141,7 @@ body {{
         defs_markup = f'<defs>{"".join(defs)}</defs>' if defs else ""
         return (
             f'<svg viewBox="{min_x} {min_y} {view_width} {view_height}" xmlns="http://www.w3.org/2000/svg" '
-            f'preserveAspectRatio="none">{defs_markup}{"".join(paths)}</svg>'
+            f'preserveAspectRatio="none" shape-rendering="geometricPrecision">{defs_markup}{"".join(paths)}</svg>'
         )
 
     def get_vector_view_box(self, node: dict[str, Any], data: dict[str, Any]) -> tuple[float, float, float, float]:
@@ -1292,9 +1355,10 @@ body {{
         if min_x or min_y:
             body = f'<g transform="translate({-min_x} {-min_y})">{body}</g>'
         defs_markup = f'<defs>{"".join(defs)}</defs>' if defs else ""
+        # 使用geometricPrecision以改善边框渲染质量
         return (
             f'<svg viewBox="0 0 {view_width} {view_height}" xmlns="http://www.w3.org/2000/svg" '
-            f'preserveAspectRatio="none">{defs_markup}{body}</svg>'
+            f'preserveAspectRatio="none" shape-rendering="geometricPrecision">{defs_markup}{body}</svg>'
         )
 
     def get_group_view_box(self, node: dict[str, Any], data: dict[str, Any]) -> tuple[float, float, float, float]:

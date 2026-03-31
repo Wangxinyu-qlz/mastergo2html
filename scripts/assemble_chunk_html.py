@@ -42,6 +42,19 @@ def ancestor_chunk_path(path: str, chunk_paths: set[str]) -> str:
     return path
 
 
+def chunk_layer_tier(chunk: dict[str, Any]) -> str:
+    tier = str(chunk.get("layerTier") or "").strip().lower()
+    if tier in {"background", "scaffold", "foreground", "overlay"}:
+        return tier
+    return "scaffold"
+
+
+def chunk_pointer_events(chunk: dict[str, Any]) -> str:
+    if chunk_layer_tier(chunk) in {"background", "scaffold"}:
+        return "none"
+    return "auto"
+
+
 def compute_chunk_z_index(chunk: dict[str, Any], root_bounds: list[float], chunk_paths: set[str]) -> int:
     path = str(chunk.get("path") or "")
     anchor_path = ancestor_chunk_path(path, chunk_paths)
@@ -64,26 +77,43 @@ def compute_chunk_z_index(chunk: dict[str, Any], root_bounds: list[float], chunk
         and child_type_counts
         and set(child_type_counts).issubset(path_like_types)
     )
+    tier = chunk_layer_tier(chunk)
+    tier_base = {
+        "background": 10000,
+        "scaffold": 100000,
+        "foreground": 300000,
+        "overlay": 500000,
+    }[tier]
 
-    score = 0
-    score += depth * 100000
-    score += sum(index * (1000 // (position + 1)) for position, index in enumerate(indices))
+    score = tier_base
+    score += depth * 1000
+    score += sum(index * (100 // (position + 1)) for position, index in enumerate(indices))
     local_weight = 1000
     for index in local_indices:
         score += index * local_weight
         local_weight = max(local_weight // 100, 1)
     if kind == "leaf":
-        score += 20000
+        score += 200
     else:
-        score -= 20000
-    if area_ratio < 0.08:
-        score += 40000
-    elif area_ratio < 0.2:
-        score += 18000
-    elif area_ratio > 0.6:
-        score -= 20000
-    if atomic_background_like:
-        score -= 30000
+        score -= 200
+    if tier == "foreground":
+        if area_ratio < 0.08:
+            score += 8000
+        elif area_ratio < 0.2:
+            score += 3000
+    elif tier == "overlay":
+        if area_ratio < 0.2:
+            score += 6000
+    elif tier == "background":
+        if area_ratio > 0.6:
+            score -= 1000
+    elif tier == "scaffold":
+        if area_ratio < 0.08:
+            score += 1200
+        elif area_ratio > 0.6:
+            score -= 1200
+    if atomic_background_like and tier in {"background", "scaffold"}:
+        score -= 3000
     return score
 
 
@@ -377,12 +407,16 @@ def main() -> None:
 
         label = chunk.get("name") or run.get("name") or run.get("id") or "chunk"
         z_index = compute_chunk_z_index(chunk, root_bounds, chunk_paths)
+        layer_tier = chunk_layer_tier(chunk)
+        pointer_events = chunk_pointer_events(chunk)
         chunk_markup_entries.append((
             z_index,
             f'      <section class="assembly-chunk" data-chunk-name="{label}" '
             f'data-chunk-kind="{chunk.get("kind") or "leaf"}" '
+            f'data-layer-tier="{layer_tier}" '
             f'style="left:{format_px(left)}px;top:{format_px(top)}px;'
-            f'width:{format_px(width)}px;height:{format_px(height)}px;z-index:{z_index};">'
+            f'width:{format_px(width)}px;height:{format_px(height)}px;z-index:{z_index};'
+            f'pointer-events:{pointer_events};">'
             f"{body_markup}</section>"
         ))
 
