@@ -934,64 +934,9 @@ body {{
 
     def should_apply_effect(self, node: dict[str, Any], data: dict[str, Any]) -> bool:
         """
-        智能判断是否应该应用效果。
-        只过滤 filter: blur，保留 backdrop-filter: blur（毛玻璃效果）和 box-shadow。
+        判断是否应该应用效果。
+        默认返回True，由子类或adapter根据具体需求覆盖此方法。
         """
-        effect_token = _get_style(node, "effect")
-        if not effect_token:
-            return True
-
-        effect_values = self.resolve_effect(data, effect_token)
-
-        # 检查是否包含 filter: blur（不包括 backdrop-filter）
-        has_filter_blur = any(
-            "filter:" in str(v) and "blur" in str(v).lower() and "backdrop" not in str(v).lower()
-            for v in effect_values
-        )
-        if not has_filter_blur:
-            return True
-
-        # 文字节点不应用 filter: blur 效果（会导致文字模糊/阴影）
-        if self.get_node_kind(node) == "text":
-            return False
-
-        # 获取节点尺寸
-        box = node.get("box", [0, 0, 0, 0])
-        width = float(box[2] or 0)
-        height = float(box[3] or 0)
-
-        # 对于小尺寸元素（特别是细线条），跳过 filter: blur 效果
-        if width < 2 or height < 2:
-            return False
-
-        # 对于细长条（长宽比>10），即使面积较大也要检查blur
-        aspect_ratio = max(width, height) / max(min(width, height), 0.1)
-        if aspect_ratio > 10:
-            for effect_str in effect_values:
-                if "filter:" in str(effect_str) and "blur" in str(effect_str).lower() and "backdrop" not in str(effect_str).lower():
-                    import re
-                    match = re.search(r"blur\(([\d\.]+)px\)", str(effect_str))
-                    if match:
-                        blur_value = float(match.group(1))
-                        min_size = min(width, height)
-                        # 对于细长条，如果blur >= 最小尺寸的50%，跳过
-                        if blur_value >= min_size * 0.5:
-                            return False
-
-        # 对于小面积元素（< 100px²），检查blur强度
-        area = width * height
-        if area < 100:
-            for effect_str in effect_values:
-                if "filter:" in str(effect_str) and "blur" in str(effect_str).lower() and "backdrop" not in str(effect_str).lower():
-                    import re
-                    match = re.search(r"blur\(([\d\.]+)px\)", str(effect_str))
-                    if match:
-                        blur_value = float(match.group(1))
-                        min_size = min(width, height)
-                        # 如果blur值 >= 元素最小尺寸的25%，跳过
-                        if blur_value >= min_size * 0.25:
-                            return False
-
         return True
 
     def resolve_fill_list(self, data: dict[str, Any], token_id: str | None) -> list[str]:
