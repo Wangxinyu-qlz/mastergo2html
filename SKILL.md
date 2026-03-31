@@ -111,13 +111,14 @@ render chunks 不再是单纯的 leaf-only：
 只负责：
 - 执行 `componentPlans / nodePlans / libraryPlans / assetPlans / manualZones`
 - 执行 `extraCssRules` 和显式 `styleOverrides`
-- 仅当 plan 显式声明时执行 `merged-svg`
+- 对 plan 显式声明的 `merged-svg` 执行合并
+- 对纯矢量子树自动走 `merged-svg` fast-path
 
 不负责：
 - 根据组件类型自动补样式
 - 根据节点名字猜 `Element Plus`
 - 在公共层生成页面专项修复
-- 自动把 vector group 合并成单个 SVG
+- 对非纯矢量 group 自动猜测是否应合并成单个 SVG
 
 ## 推荐的模型决策入口
 
@@ -151,8 +152,8 @@ render chunks 不再是单纯的 leaf-only：
 
 其中 `merged-svg` 的约束是：
 
-- 只能由模型在 plan 中显式声明
-- renderer 不会再自动推断任何节点应该合并为 SVG
+- 可以由模型在 plan 中显式声明
+- 纯矢量子树会被公共脚本自动提升为 `merged-svg`
 - 适用于纯视觉图形或确认应拍平成单个 SVG 的子树
 
 ## 关键原则
@@ -160,5 +161,6 @@ render chunks 不再是单纯的 leaf-only：
 - 公共脚本不写组件专项特判
 - 公共脚本不写页面专项特判
 - 公共渲染器不根据组件类型自动决定样式
+- 公共脚本允许对“纯矢量子树”做通用 fast-path，不依赖页面名或业务语义
 - 所有公共组件库覆写都必须来自显式 plan
 - 对复杂原型优先先递归切块，再逐块进入后续流程，而不是整页直接送入模型

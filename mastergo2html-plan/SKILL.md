@@ -86,8 +86,9 @@ python3 skill/mastergo2htmlV3/scripts/build_render_plan.py \
 - 当前节点或组件根允许被渲染器压成单个 SVG
 
 边界：
-- 只有 plan 明确写了 `merged-svg` 或 `mergeAsSvg: true`，渲染器才会合并
-- 不写时，即使节点是纯 vector group，渲染器也不会自动合并
+- plan 明确写了 `merged-svg` 或 `mergeAsSvg: true` 时，渲染器一定会合并
+- 对纯矢量子树，公共脚本也会自动补一条 `renderer: "merged-svg"` 的 node plan
+- 对非纯矢量 group，仍然不会自动猜测合并
 
 `layoutDecision` 也必须由模型显式写入，公共脚本不会自动推断。
 

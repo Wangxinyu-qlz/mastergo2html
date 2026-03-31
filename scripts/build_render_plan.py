@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from pipeline_utils import (
+    collect_nodes,
     infer_prototype_key_from_meta,
     load_json,
     normalize_prototype_key,
@@ -118,6 +119,51 @@ def collect_extra_css_rules(
     return rules
 
 
+VECTOR_CONTAINER_KINDS = {"group", "frame", "instance"}
+VECTOR_LEAF_KINDS = {"path", "line", "vector", "svg_ellipse", "svg_polygon", "boolean_operation"}
+
+
+def pure_vector_art_profile(node: dict[str, Any]) -> dict[str, Any]:
+    vector_leaf_count = 0
+    text_count = 0
+    other_leaf_count = 0
+    structural_count = 0
+
+    def walk(current: dict[str, Any], *, include_self: bool) -> None:
+        nonlocal vector_leaf_count, text_count, other_leaf_count, structural_count
+        kind = str(current.get("kind") or "")
+        if include_self:
+            if kind == "text":
+                text_count += 1
+            elif current.get("vector") or kind in VECTOR_LEAF_KINDS:
+                vector_leaf_count += 1
+            elif kind in VECTOR_CONTAINER_KINDS:
+                structural_count += 1
+            elif not (current.get("children") or []):
+                other_leaf_count += 1
+        for child in current.get("children") or []:
+            walk(child, include_self=True)
+
+    walk(node, include_self=False)
+    drawable_count = vector_leaf_count + other_leaf_count
+    vector_density = (vector_leaf_count / drawable_count) if drawable_count else 0.0
+    is_pure_vector_art = bool(
+        vector_leaf_count
+        and text_count == 0
+        and other_leaf_count == 0
+        and str(node.get("kind") or "") in VECTOR_CONTAINER_KINDS
+        and bool(node.get("children") or [])
+    )
+    return {
+        "vectorLeafCount": vector_leaf_count,
+        "textCount": text_count,
+        "otherLeafCount": other_leaf_count,
+        "structuralCount": structural_count,
+        "vectorDensity": round(vector_density, 5),
+        "isPureVectorArt": is_pure_vector_art,
+    }
+
+
 def build_plan(
     compressed: dict[str, Any],
     semantic: dict[str, Any],
@@ -127,6 +173,7 @@ def build_plan(
     mode: str,
 ) -> dict[str, Any]:
     roots = compressed.get("roots") or []
+    all_nodes, _ = collect_nodes(roots)
     prototype_key = resolve_prototype_key(compressed, semantic, structure)
     root_node_id = str(roots[0].get("id") or "") if roots else ""
     root_component_id = f"cmp_{class_name(root_node_id or prototype_key, 'page-root')}"
@@ -232,6 +279,35 @@ def build_plan(
         asset_decision = render_decision.get("assetPlan")
         if isinstance(asset_decision, dict) and asset_decision:
             asset_plans.append({"nodeId": node_id, **asset_decision})
+
+    planned_node_ids = {str(item.get("nodeId") or "") for item in node_plans}
+    for node in all_nodes:
+        node_id = str(node.get("id") or "")
+        if not node_id or node_id in planned_node_ids:
+            continue
+        profile = pure_vector_art_profile(node)
+        if not profile["isPureVectorArt"]:
+            continue
+        node_plans.append(
+            {
+                "nodeId": node_id,
+                "renderer": "merged-svg",
+                "phase": "detail",
+                "html": {},
+                "layoutDecision": {},
+                "stylePolicy": {
+                    "autoReason": "pure-vector-art",
+                    "vectorLeafCount": profile["vectorLeafCount"],
+                    "vectorDensity": profile["vectorDensity"],
+                },
+                "library": "custom",
+                "libraryComponent": "",
+                "props": {},
+                "componentType": "vector-art",
+                "styleOverrides": {},
+            }
+        )
+        planned_node_ids.add(node_id)
 
     if not framework_plan and root_node_id:
         framework_plan.append(

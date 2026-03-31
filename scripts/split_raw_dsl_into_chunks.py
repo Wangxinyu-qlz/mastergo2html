@@ -132,22 +132,71 @@ def child_type_counts(node: dict[str, Any]) -> dict[str, int]:
     return counts
 
 
+RAW_VECTOR_TYPES = {
+    "PATH",
+    "VECTOR",
+    "LINE",
+    "SVG_ELLIPSE",
+    "SVG_POLYGON",
+    "BOOLEAN_OPERATION",
+    "STAR",
+    "REGULAR_POLYGON",
+    "LAYER",
+}
+
+RAW_STRUCTURAL_TYPES = {"FRAME", "GROUP", "INSTANCE", "COMPONENT", "COMPONENT_SET"}
+
+
+def vector_subtree_metrics(node: dict[str, Any]) -> dict[str, Any]:
+    vector_count = 0
+    text_count = 0
+    structural_count = 0
+    other_count = 0
+
+    def walk(current: dict[str, Any], *, include_self: bool) -> None:
+        nonlocal vector_count, text_count, structural_count, other_count
+        if include_self:
+            kind = str(current.get("type") or "UNKNOWN")
+            if kind == "TEXT":
+                text_count += 1
+            elif kind in RAW_STRUCTURAL_TYPES:
+                structural_count += 1
+            elif kind in RAW_VECTOR_TYPES:
+                vector_count += 1
+            else:
+                other_count += 1
+        for child in current.get("children") or []:
+            walk(child, include_self=True)
+
+    walk(node, include_self=False)
+    drawable_count = vector_count + other_count
+    vector_density = (vector_count / drawable_count) if drawable_count else 0.0
+    return {
+        "vectorNodeCount": vector_count,
+        "textNodeCount": text_count,
+        "structuralNodeCount": structural_count,
+        "otherNodeCount": other_count,
+        "drawableNodeCount": drawable_count,
+        "vectorDensity": round(vector_density, 5),
+        "isPureVectorArt": bool(vector_count and text_count == 0 and other_count == 0),
+    }
+
+
 def is_atomic_visual_subtree(node: dict[str, Any]) -> bool:
     descendants = count_descendants(node)
     if descendants < 4:
         return False
-    if count_types(node, "TEXT") > 0:
-        return False
     if node.get("flexContainerInfo"):
         return False
-    visual_count = (
-        count_types(node, "PATH")
-        + count_types(node, "LAYER")
-        + count_types(node, "SVG_ELLIPSE")
-    )
-    structural_count = count_types(node, "FRAME") + count_types(node, "GROUP")
+    metrics = vector_subtree_metrics(node)
+    if metrics["isPureVectorArt"]:
+        return True
+    if metrics["textNodeCount"] > 0:
+        return False
+    visual_count = metrics["vectorNodeCount"]
+    structural_count = metrics["structuralNodeCount"]
     # Keep dense vector/icon/chart groups intact instead of splitting by raw counts.
-    return visual_count >= max(3, descendants - structural_count)
+    return bool(visual_count >= 3 and metrics["vectorDensity"] >= 0.85 and descendants >= max(4, structural_count + 1))
 
 
 def structural_score(node: dict[str, Any], depth: int) -> int:
@@ -281,6 +330,7 @@ def has_structural_children(node: dict[str, Any]) -> bool:
 
 
 def make_metrics(node: dict[str, Any], root_box: list[float], absolute_x: float, absolute_y: float) -> dict[str, Any]:
+    vector_metrics = vector_subtree_metrics(node)
     return {
         "bounds": node_box(node),
         "absoluteBounds": node_box_absolute(node, absolute_x, absolute_y),
@@ -296,6 +346,9 @@ def make_metrics(node: dict[str, Any], root_box: list[float], absolute_x: float,
         "areaRatio": round(area_ratio(node, root_box), 5),
         "hasStructuralChildren": has_structural_children(node),
         "hasVisualPayload": has_visual_payload(node),
+        "vectorNodeCount": vector_metrics["vectorNodeCount"],
+        "vectorDensity": vector_metrics["vectorDensity"],
+        "isAtomicVectorArt": vector_metrics["isPureVectorArt"],
     }
 
 
@@ -455,6 +508,7 @@ def chunk_summary(candidate: Candidate, index: int) -> dict[str, Any]:
     descendants = count_descendants(node)
     absolute_bounds = candidate.absolute_bounds or node_box(node)
     relative_bounds = node_box(node)
+    vector_metrics = vector_subtree_metrics(node)
     summary = {
         "index": index,
         "id": str(node.get("id") or ""),
@@ -474,6 +528,9 @@ def chunk_summary(candidate: Candidate, index: int) -> dict[str, Any]:
         "groupNodeCount": count_types(node, "GROUP"),
         "frameNodeCount": count_types(node, "FRAME"),
         "pathNodeCount": count_types(node, "PATH"),
+        "vectorNodeCount": vector_metrics["vectorNodeCount"],
+        "vectorDensity": vector_metrics["vectorDensity"],
+        "isAtomicVectorArt": vector_metrics["isPureVectorArt"],
         "childTypeCounts": child_type_counts(node),
         "textPreview": first_text(node),
     }

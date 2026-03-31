@@ -375,6 +375,87 @@ body {{
     def has_vector(self, node: dict[str, Any]) -> bool:
         return bool(node.get("vector"))
 
+    def is_vector_shape_leaf(self, node: dict[str, Any]) -> bool:
+        return self.has_vector(node) or self.get_node_kind(node) in {"svg_ellipse"}
+
+    def is_pure_vector_art_group(self, node: dict[str, Any], data: dict[str, Any]) -> bool:
+        kind = self.get_node_kind(node)
+        if kind not in {"group", "frame", "instance"}:
+            return False
+        if self.is_vector_shape_leaf(node):
+            return False
+        if self.get_manual_zone(node, data) or self.get_asset_plan(node, data) or self.get_library_plan(node, data):
+            return False
+        children = self.get_children(node)
+        if not children:
+            return False
+
+        vector_leaf_count = 0
+
+        def walk(current: dict[str, Any]) -> bool:
+            nonlocal vector_leaf_count
+            if self.is_vector_shape_leaf(current):
+                vector_leaf_count += 1
+                return True
+            current_kind = self.get_node_kind(current)
+            if current_kind == "text":
+                return False
+            nested = self.get_children(current)
+            if current_kind not in {"group", "frame", "instance"} or not nested:
+                return False
+            return all(walk(child) for child in nested)
+
+        return all(walk(child) for child in children) and vector_leaf_count > 0
+
+    def build_shape_fill_markup(
+        self,
+        *,
+        node: dict[str, Any],
+        data: dict[str, Any],
+        defs: list[str],
+        segment_index: int,
+        fill_values: list[str],
+    ) -> list[str]:
+        node_id = self.get_node_id(node) or "node"
+        rendered: list[str] = []
+        for fill_index, fill_value in enumerate(fill_values):
+            fill = fill_value.strip()
+            if fill.startswith("linear-gradient("):
+                parsed = parse_linear_gradient(fill)
+                if parsed:
+                    gradient_id = f"{node_id}-grad-{segment_index}-{fill_index}"
+                    attrs, stops = parsed
+                    stop_markup = "".join(
+                        f'<stop offset="{escape_attr(offset)}" stop-color="{escape_attr(color)}"></stop>'
+                        for color, offset in stops
+                    )
+                    defs.append(
+                        f'<linearGradient id="{escape_attr(gradient_id)}" '
+                        f'x1="{attrs["x1"]}" y1="{attrs["y1"]}" x2="{attrs["x2"]}" y2="{attrs["y2"]}">{stop_markup}</linearGradient>'
+                    )
+                    fill = f"url(#{gradient_id})"
+                else:
+                    fill = "#8DD2FF"
+            elif fill.startswith("radial-gradient("):
+                parsed = parse_radial_gradient(fill)
+                if parsed:
+                    gradient_id = f"{node_id}-grad-{segment_index}-{fill_index}"
+                    attrs, stops = parsed
+                    stop_markup = "".join(
+                        f'<stop offset="{escape_attr(offset)}" stop-color="{escape_attr(color)}"></stop>'
+                        for color, offset in stops
+                    )
+                    defs.append(
+                        f'<radialGradient id="{escape_attr(gradient_id)}" '
+                        f'cx="{attrs["cx"]}" cy="{attrs["cy"]}" r="{attrs["r"]}" '
+                        f'fx="{attrs["fx"]}" fy="{attrs["fy"]}">{stop_markup}</radialGradient>'
+                    )
+                    fill = f"url(#{gradient_id})"
+                else:
+                    fill = "transparent"
+            rendered.append(fill)
+        return rendered
+
     def should_merge_group_as_svg(self, node: dict[str, Any], data: dict[str, Any]) -> bool:
         node_plan = self.get_node_plan(node, data) or {}
         component_plan = self.get_component_plan(node, data) or {}
@@ -383,6 +464,8 @@ body {{
         if str(component_plan.get("renderer") or "") == "merged-svg":
             return True
         if bool(node_plan.get("mergeAsSvg")) or bool(component_plan.get("mergeAsSvg")):
+            return True
+        if self.is_pure_vector_art_group(node, data):
             return True
         return False
 
@@ -401,7 +484,7 @@ body {{
             return False
 
         def _mergeable(current: dict[str, Any]) -> bool:
-            if self.has_vector(current):
+            if self.is_vector_shape_leaf(current):
                 return True
             if self.get_node_kind(current) not in {"group", "frame", "instance"}:
                 return False
@@ -983,44 +1066,49 @@ body {{
                 path_attrs = self.get_vector_path_attrs(node, data, segment_index, segment)
                 fill_values = self.resolve_fill_list(data, segment.get("fill")) or ["transparent"]
                 extra_attrs = f" {' '.join(path_attrs)}" if path_attrs else ""
-                for fill_index, fill_value in enumerate(fill_values):
-                    fill = fill_value.strip()
-                    if fill.startswith("linear-gradient("):
-                        parsed = parse_linear_gradient(fill)
-                        if parsed:
-                            gradient_id = f"{node_id}-grad-{segment_index}-{fill_index}"
-                            attrs, stops = parsed
-                            stop_markup = "".join(
-                                f'<stop offset="{escape_attr(offset)}" stop-color="{escape_attr(color)}"></stop>'
-                                for color, offset in stops
-                            )
-                            defs.append(
-                                f'<linearGradient id="{escape_attr(gradient_id)}" '
-                                f'x1="{attrs["x1"]}" y1="{attrs["y1"]}" x2="{attrs["x2"]}" y2="{attrs["y2"]}">{stop_markup}</linearGradient>'
-                            )
-                            fill = f"url(#{gradient_id})"
-                        else:
-                            fill = "#8DD2FF"
-                    elif fill.startswith("radial-gradient("):
-                        parsed = parse_radial_gradient(fill)
-                        if parsed:
-                            gradient_id = f"{node_id}-grad-{segment_index}-{fill_index}"
-                            attrs, stops = parsed
-                            stop_markup = "".join(
-                                f'<stop offset="{escape_attr(offset)}" stop-color="{escape_attr(color)}"></stop>'
-                                for color, offset in stops
-                            )
-                            defs.append(
-                                f'<radialGradient id="{escape_attr(gradient_id)}" '
-                                f'cx="{attrs["cx"]}" cy="{attrs["cy"]}" r="{attrs["r"]}" '
-                                f'fx="{attrs["fx"]}" fy="{attrs["fy"]}">{stop_markup}</radialGradient>'
-                            )
-                            fill = f"url(#{gradient_id})"
-                        else:
-                            fill = "transparent"
+                for fill in self.build_shape_fill_markup(
+                    node=node,
+                    data=data,
+                    defs=defs,
+                    segment_index=segment_index,
+                    fill_values=fill_values,
+                ):
                     path_markup.append(f'<path d="{d}" fill="{escape_attr(fill)}"{extra_attrs}></path>')
             transform = f' transform="translate({local_x} {local_y})"' if local_x or local_y else ""
             return f"<g{transform}{filter_attr}>{''.join(path_markup)}</g>"
+
+        if self.get_node_kind(node) == "svg_ellipse":
+            node_id = self.get_node_id(node) or "node"
+            effect_token = str((node.get("style") or {}).get("effect") or "")
+            filter_attr = ""
+            if effect_token:
+                filter_id = f"{node_id}-filter"
+                filter_markup = self.build_svg_filter_markup(filter_id, self.resolve_effect(data, effect_token))
+                if filter_markup:
+                    defs.append(filter_markup)
+                    filter_attr = f' filter="url(#{escape_attr(filter_id)})"'
+            _, _, width, height = node.get("box", [0, 0, 0, 0])
+            rx = max(float(width or 0) / 2.0, 0.0)
+            ry = max(float(height or 0) / 2.0, 0.0)
+            fill_values = self.resolve_fill_list(data, node.get("fill")) or ["transparent"]
+            rendered_fills = self.build_shape_fill_markup(
+                node=node,
+                data=data,
+                defs=defs,
+                segment_index=0,
+                fill_values=fill_values,
+            )
+            style = node.get("style") or {}
+            stroke_values = self.resolve_fill_list(data, style.get("strokeColor"))
+            stroke = stroke_values[0] if stroke_values else "none"
+            stroke_width = style.get("strokeWidth") or "0"
+            ellipses = [
+                f'<ellipse cx="{rx}" cy="{ry}" rx="{rx}" ry="{ry}" fill="{escape_attr(fill)}" '
+                f'stroke="{escape_attr(stroke)}" stroke-width="{escape_attr(str(stroke_width))}"></ellipse>'
+                for fill in rendered_fills
+            ]
+            transform = f' transform="translate({local_x} {local_y})"' if local_x or local_y else ""
+            return f"<g{transform}{filter_attr}>{''.join(ellipses)}</g>"
 
         child_markup = [
             self.build_vector_group_markup(child, data, defs)
@@ -1064,6 +1152,10 @@ body {{
                 min_x, min_y, width, height = self.get_vector_view_box(current, data)
                 boxes.append((local_x + min_x, local_y + min_y, width, height))
                 return
+            if self.get_node_kind(current) == "svg_ellipse":
+                _, _, width, height = current.get("box", [0, 0, 0, 0])
+                boxes.append((local_x, local_y, float(width or 0), float(height or 0)))
+                return
             for child in self.get_children(current):
                 walk(child, local_x, local_y, False)
 
@@ -1092,6 +1184,8 @@ body {{
         return svg_markup
 
     def vector_css_overrides(self, node: dict[str, Any], data: dict[str, Any]) -> list[str]:
+        if self.can_merge_group_as_svg(node, data):
+            return ["  overflow: hidden;"]
         return []
 
     def node_css_overrides(self, node: dict[str, Any], data: dict[str, Any]) -> list[str]:

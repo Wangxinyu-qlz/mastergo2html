@@ -83,6 +83,8 @@ python3 skill/mastergo2htmlV3/scripts/render_any_dsl_to_html.py \
 
 渲染器才会把对应 vector group 合并成单个 SVG。
 
+另外，如果某个节点是纯矢量子树（只有 vector leaf / 结构容器，没有文本或普通 DOM 叶子），渲染器也会自动走同一条 `merged-svg` fast-path。
+
 如果某个 `componentPlan` 或 `nodePlan` 显式声明 `layoutDecision`，渲染器会按该决策覆写定位或内容对齐。
 
 当前支持：
@@ -94,6 +96,6 @@ python3 skill/mastergo2htmlV3/scripts/render_any_dsl_to_html.py \
 - 根据节点名称猜组件库组件
 - 根据组件类型自动生成弹层样式
 - 在公共层注入页面专项修复
-- 自动把纯 vector group 合并成 SVG
+- 对非纯矢量 group 自动猜测是否应合并成 SVG
 
 当 `libraryPlans` 非空时，仍会按 plan 挂载 Vue 3 + `Element Plus` CDN 组件。
