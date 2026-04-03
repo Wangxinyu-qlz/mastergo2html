@@ -10,91 +10,82 @@ user-invocable: true
 
 ## 前置检查
 
-### 1. 读取配置
+### 1. 检查配置文件
 
-读取 `.d2c/config.json`，获取 `mastergo_api_key` 和 `mastergo_base_url`。
+检查 `.mastergo2html/config.json` 是否存在。
 
-如果配置文件不存在或 Key 为空，提示用户先执行 `/d2c-setup` 配置 API Key。
-
-### 2. 解析用户输入
-
-用户输入: $ARGUMENTS
-
-从用户输入中提取 MasterGo URL。支持以下格式：
-- 完整 URL: `https://mastergo.iflytek.com/file/{fileId}?layer_id={layerId}`
-- 也可能直接提供 `fileId` 和 `layerId`
-
-**URL 解析规则**：
-- **fileId**: 从 URL 路径 `/file/{fileId}` 中提取（正则：`/file/([^/?]+)`）
-- **layerId**: 从 URL 查询参数 `layer_id` 中提取，**URL 解码后，如果包含 `/`（复合路径），只取第一个 `/` 之前的部分**。例如：`97%3A3583%2F748%3A18916` → 解码为 `97:3583/748:18916` → 最终取 `97:3583`
-
-如果缺少 `fileId` 或 `layerId`，提示用户提供完整信息。
+如果配置文件不存在或 API Key 为空，提示用户先执行 `/mastergo2html-setup` 配置 API Key。
 
 ## 执行步骤
 
-### 3. 调用 MasterGo API 获取 DSL
+### 2. 调用 Python 脚本获取 DSL
 
-使用 curl 调用 MasterGo 的 DSL 接口：
+用户输入: $ARGUMENTS
+
+直接使用 `scripts/fetch_mastergo.py` 脚本获取设计稿数据：
 
 ```bash
-curl -s \
-  -H "X-MG-UserAccessToken: <api_key>" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json" \
-  "https://mastergo.iflytek.com/mcp/dsl?fileId=<fileId>&layerId=<layerId>"
+python3 scripts/fetch_mastergo.py "$ARGUMENTS"
 ```
 
-**注意**：
-- 认证头为 `X-MG-UserAccessToken`（不是 Bearer）
-- 端点为 `GET /mcp/dsl`，参数通过 query string 传递
-- 响应是完整的 DSL JSON 对象
+**脚本功能**：
+- 自动解析 MasterGo URL，提取 fileId 和 layerId
+- 读取 `.mastergo2html/config.json` 中的 API Key
+- 尝试多个 API 端点获取 DSL 数据
+- 自动创建原型目录并保存数据
 
-### 4. 处理响应
+**支持的 URL 格式**：
+- `https://mastergo.iflytek.com/file/{fileId}?layer_id={layerId}`
+- `https://mastergo.iflytek.com/file/{fileId}?page_id={pageId}&layer_id={layerId}`
 
-**成功**：为当前原型创建独立目录，目录名固定为 `<fileId>__<layerId>`，整体结构如下：
+### 3. 处理脚本输出
+
+### 3. 处理脚本输出
+
+**成功**：脚本会自动创建目录结构并保存数据：
 
 ```text
 .mastergo2html/
 ├── config.json
 └── prototypes/
     └── <fileId>__<layerId>/
-        ├── dsl_raw.json
-        ├── fetch_meta.json
-        ├── dsl.compressed.json
-        ├── semantic.map.json
-        ├── render.plan.json
-        ├── analysis.md
-        └── output/
+        ├── dsl_raw.json          # 原始 DSL 数据
+        ├── fetch_meta.json       # 获取元数据
+        └── (后续流程产物...)
 ```
 
-将 DSL 数据保存到 `.mastergo2html/prototypes/<fileId>__<layerId>/dsl_raw.json`，同时保存元数据到 `.mastergo2html/prototypes/<fileId>__<layerId>/fetch_meta.json`：
+脚本输出示例：
+```
+Fetching MasterGo design:
+  File ID: 184567064862635
+  Layer ID: 219:01256
 
-```json
-{
-  "file_id": "提取的fileId",
-  "layer_id": "提取的layerId",
-  "prototype_key": "<fileId>__<layerId>",
-  "prototype_dir": ".mastergo2html/prototypes/<fileId>__<layerId>",
-  "source_url": "原始MasterGo URL",
-  "fetched_at": "ISO8601时间戳",
-  "dsl_size_bytes": DSL数据大小,
-  "node_count": 顶层节点数量估算
-}
+Fetching data from MasterGo API...
+  Trying: https://mastergo.iflytek.com/api/file/...
+  ✓ Success!
+
+✓ Data fetched successfully!
+  Prototype key: 184567064862635__21901256
+  Saved to: .mastergo2html/prototypes/184567064862635__21901256
+  DSL size: 45525 bytes
 ```
 
-**失败**：根据错误码提示：
-- 401/403: API Key 无效或过期，建议执行 `/mastergo2html-setup` 重新配置
-- 404: 文件或图层不存在，检查 URL 是否正确
-- 500: MasterGo 服务端错误，稍后重试
-- 网络错误: 检查网络连接
+**失败**：脚本会尝试多个 API 端点，如果全部失败会提示：
+- API Key 可能无效，建议执行 `/mastergo2html-setup` 重新配置
+- 文件或图层不存在，检查 URL 是否正确
+- 网络错误或 MasterGo 服务端问题
 
-### 6. DSL 数据预览
+### 4. DSL 数据预览
 
-成功获取后，直接使用 Read 工具读取 `.mastergo2html/prototypes/<fileId>__<layerId>/dsl_raw.json` 的前 200 行内容输出给用户预览，让用户直观看到 DSL 的实际数据结构。同时说明文件总大小和原型目录。
+### 4. DSL 数据预览
 
-### 7. 提示下一步
+成功获取后，读取 `fetch_meta.json` 获取原型信息，然后使用 Read 工具读取 `dsl_raw.json` 的前 100 行内容输出给用户预览，让用户直观看到 DSL 的实际数据结构。
+
+### 5. 提示下一步
 
 告知用户：
-- DSL 数据已保存到 `.mastergo2html/prototypes/<fileId>__<layerId>/dsl_raw.json`
-- 原型元数据已保存到 `.mastergo2html/prototypes/<fileId>__<layerId>/fetch_meta.json`
-- 执行 `/mastergo2html-compress --target <fileId>__<layerId>` 压缩 DSL 数据
+- DSL 数据已保存到 `.mastergo2html/prototypes/<prototype_key>/dsl_raw.json`
+- 原型元数据已保存到 `.mastergo2html/prototypes/<prototype_key>/fetch_meta.json`
+- 下一步可以执行：
+  - `/mastergo2html-compress --target <prototype_key>` 压缩 DSL 数据
+  - 或直接使用完整流程处理
